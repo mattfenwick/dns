@@ -2,10 +2,15 @@ package app
 
 import (
 	"fmt"
-	"os"
-
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/dns/cmd/kube-dns/app/options"
 	"k8s.io/dns/pkg/dns/config"
+	"k8s.io/dns/pkg/version"
+	"os"
+	"runtime"
 
 	"net"
 	"strings"
@@ -68,9 +73,53 @@ func isLockedErr(err error) bool {
 	return strings.Contains(err.Error(), "holding the xtables lock")
 }
 
+func userAgent() string {
+	return fmt.Sprintf("kube-dns/%s (%s/%s)", version.VERSION, runtime.GOOS, runtime.GOARCH)
+}
+
+func newKubeClient(dnsConfig *options.KubeDNSConfig) (kubernetes.Interface, error) {
+	var config *rest.Config
+	var err error
+
+	// If both kubeconfig and master URL are empty, use service account
+	if dnsConfig.KubeConfigFile == "" && dnsConfig.KubeMasterURL == "" {
+		config, err = rest.InClusterConfig()
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		config, err = clientcmd.BuildConfigFromFlags(
+			dnsConfig.KubeMasterURL, dnsConfig.KubeConfigFile)
+		if err != nil {
+			return nil, err
+		}
+	}
+	// Use protobufs for communication with apiserver.
+	config.ContentType = "application/vnd.kubernetes.protobuf"
+	config.UserAgent = userAgent()
+
+	return kubernetes.NewForConfig(config)
+}
+
 // Init initializes the parameters and networking setup necessary to run node-cache
 func (c *CacheApp) Init() {
 	c.netifHandle = netif.NewNetifManager(c.params.LocalIPs)
+
+	kc, err := newKubeClient(c.kubednsConfig)
+	if err == nil {
+		nodes, err := kc.CoreV1().Nodes().List(metav1.ListOptions{})
+		if err != nil {
+			clog.Errorf("unable to get nodes: %+v", err)
+		} else if len(nodes.Items) > 0 {
+			isIPv6 := strings.Contains(nodes.Items[0].Spec.PodCIDR, ":")
+			if isIPv6 {
+				clog.Warningf("Cluster is IPv6, but node-local-dns only supports IPv4")
+			}
+		}
+	} else {
+		clog.Errorf("unable to get kube client: %+v", err)
+	}
+
 	if c.params.SetupIptables {
 		c.initIptables()
 	}
